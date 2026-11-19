@@ -40,3 +40,5 @@ dotnet build DeskMonitor.sln -c Release
 ## 来源与许可
 
 任务栏、悬浮窗和系统指标基于 LineSoft 的 TaskMonitor。DeskMonitor 增加了独立插件宿主、插件管理、外观设置以及三个可独立安装的插件。原项目的 Apache-2.0 许可和版权声明已保留。[上游项目](https://github.com/linesoft2/TaskMonitor) · [许可证](LICENSE) · [第三方组件声明](THIRD-PARTY-NOTICES.md)
+
+界面使用由 iNKORE Studios 及其贡献者开发的 [iNKORE.UI.WPF.Modern](https://github.com/iNKORE-NET/UI.WPF.Modern)。
