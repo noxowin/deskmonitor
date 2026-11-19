@@ -1,0 +1,1199 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Threading;
+using iNKORE.UI.WPF.Modern.Common.IconKeys;
+using iNKORE.UI.WPF.Modern.Controls;
+using iNKORE.UI.WPF.Modern.Helpers;
+
+namespace deskmonitor
+{
+    /// <summary>
+    /// The settings window — a WinUI-look shell (iNKORE modern window style + Mica)
+    /// whose left pane is an iNKORE NavigationView, one item per 类别 (Win11 Settings
+    /// style; PaneDisplayMode Auto — labeled ≥1008 DIP, icon-compact 641–1007, minimal
+    /// hamburger below): 通用 (开机自启动 / 采样间隔 / 检查更新 / 更新源), 外观 (主题 / 靠左显示 — an
+    /// expander whose item is 靠左位置, or a plain card where that item does not exist,
+    /// i.e. on the classical Win10 taskbar — plus 紧凑模式, 显示分割线, 项目顺序 (the shared
+    /// taskbar/floating drag-to-reorder list), and 悬浮模式 with its five sub-cards), 采样项目 (one expander per metric, the toggle in
+    /// its content area enabling/disabling that metric's sampling; 磁盘's and GPU's
+    /// expanders also hold 显示方式 + the specific-device picker, GPU's additionally the
+    /// 任务栏显示 (使用率/温度/两者) trio with 温度来源 and 温度单位, 网络's the 适配器
+    /// picker, the 公网 IP lookup switch and the Clash/Mihomo integration (switch +
+    /// endpoint + 测试连接); plus the section-wide 合并相同程序 card); 插件 hosts the
+    /// plugin manager as an inline page; 关于 lives at the
+    /// pane's bottom-left (FooterMenuItems) and is NOT a card page — a centred hero
+    /// (logo/name/version pill), the app's own live CPU waveform (push-fed by
+    /// <see cref="RefreshAbout"/> off App's SnapshotChanged pump — no timer here), two
+    /// plain link buttons and the copyright line. <see cref="NavView_SelectionChanged"/>
+    /// switches the existing pages by visibility, preserving each page's scroll
+    /// position and the plugin list selection.
+    /// Opened from the taskbar overlay's right-click menu (App keeps at most one
+    /// instance). Every card is live: initial values + change callbacks arrive via the
+    /// ctor (App owns settings.yaml, the scheduled task, the app theme and the taskbar
+    /// overlay).
+    /// </summary>
+    public partial class SettingsWindow : Window
+    {
+        private readonly Action<bool, bool> _placementChanged;
+        private readonly Action<IReadOnlyList<TaskbarDisplaySelection>> _displaySelectionChanged;
+        private readonly Action<bool> _autoStartChanged;
+        private readonly Action<int> _themeChanged;           // 0=跟随系统 1=浅色 2=深色
+        private readonly Action<string> _accentChanged;
+        private readonly Action<int> _paneWidthChanged;
+        private readonly SolidColorBrush _systemAccentBrush = new SolidColorBrush();
+        private double _paneDragStart;
+        private double _panePointerStart;
+        internal const int DefaultPaneWidth = 220;
+        private const int MinPaneWidth = 160;
+        private const int MaxPaneWidth = 420;
+        private readonly Action<bool> _compactChanged;        // 紧凑模式 (the item pitch)
+        private readonly Action<bool> _showSeparatorsChanged; // 显示分割线 (taskbar + floating)
+        private readonly Action<IReadOnlyList<int>> _itemOrderChanged;
+        private IReadOnlyList<int> _defaultItemOrder;
+        private IReadOnlyDictionary<int, string> _pluginNames;
+        private readonly List<MetricOrderItem> _itemOrderItems = new List<MetricOrderItem>();
+        private MetricOrderItem _dragItem;
+        private Point _dragStart;
+        private readonly Action<bool> _floatingChanged;       // 悬浮模式 (the whole form flips)
+        private readonly Action<bool> _floatingTopmostChanged; // 悬浮模式 → 置顶显示
+        private readonly Action<bool> _floatingOutOfBoundsChanged; // 悬浮模式 → 允许超出屏幕边界
+        private readonly Action<bool> _floatingEdgeHideChanged; // 悬浮模式 → 贴边隐藏
+        private readonly Action<bool> _floatingFullscreenHideChanged; // 悬浮模式 → 全屏时隐藏
+        private readonly Action<double> _floatingOpacityChanged; // 悬浮模式 → 透明度 (0.2–1.0)
+        private readonly Action<int> _intervalChanged;        // ms: 500 / 1000 / 2000
+        private readonly Action<int, bool> _samplingChanged;  // (overlay hit slot 0–4, enabled)
+        private readonly PluginManagerView _pluginManager;
+        private readonly Action<bool> _mergeSamePathChanged;  // 合并相同程序
+        private readonly Action<int, int> _diskDisplayChanged; // (mode 0=平均 1=最高 2=特定, PhysicalDrive index)
+        private readonly Action<int, int> _gpuDisplayChanged;  // (mode 0=平均 1=最高 2=特定, "GPU N" number)
+        private readonly Action<int, int, bool> _gpuTaskbarContentChanged; // (content 0=使用率 1=温度 2=两者, 温度来源 -1=最高, 华氏度)
+        private readonly Action<string, string> _netAdapterChanged; // (adapter Id or "" = 自动, display name)
+        private readonly Action<bool> _publicIpLookupChanged;       // 公网 IP lookup
+        private readonly Action<bool, string, string> _clashApiChanged; // (enabled, controller address or "" = default, API secret)
+        // Reads SamplingController's latest snapshot — the About page's live
+        // CPU waveform; the same single-source push model as the detail windows.
+        private readonly Func<SystemSnapshot> _snapshotProvider;
+        // 500ms single-shot debounce for the two Clash text boxes — a yaml write +
+        // sampler retarget must not fire on every keystroke.
+        private DispatcherTimer _clashDebounce;
+        // Guards the event handlers while the ctor pushes the initial state into the
+        // controls (setting IsOn / SelectedIndex fires Toggled / SelectionChanged).
+        private bool _loaded;
+        // 靠左显示's host: the expander on Win11, the plain card on the classical (Win10)
+        // taskbar (see the ctor) — only the one actually shown gets enabled/disabled.
+        private readonly Control _onLeftHost;
+
+        private sealed class MetricOrderItem
+        {
+            public int Slot { get; set; }
+            public string Name { get; set; }
+        }
+
+        /// <param name="overlayOnLeft">Effective 靠左显示 state (yaml null = the left default).</param>
+        /// <param name="snapToStart">Current overlaySnapToStart value (left-side anchor).</param>
+        /// <param name="placementChanged">(onLeft, snapToStart) reported on every user change.</param>
+        /// <param name="autoStartOn">Whether the logon scheduled task currently exists.</param>
+        /// <param name="autoStartChanged">Reported with the requested on/off; on a schtasks
+        /// failure App calls <see cref="SyncAutoStart"/> to snap the toggle back.</param>
+        /// <param name="themeIndex">0=跟随系统 (yaml null) 1=浅色 2=深色.</param>
+        /// <param name="compactLayout">Current 紧凑模式 state (yaml null = the off default).</param>
+        /// <param name="compactLayoutChanged">Reported with the requested on/off — applied
+        /// live (the overlay re-lays out and resizes at once; both forms follow).</param>
+        /// <param name="showSeparators">Current 显示分割线 state (yaml null = the on default).</param>
+        /// <param name="showSeparatorsChanged">Reported with the requested on/off — redraws
+        /// both overlay forms without changing their layout.</param>
+        /// <param name="itemOrder">Current slot order, shared by the taskbar and floating forms.</param>
+        /// <param name="itemOrderChanged">Reported once after a drag is dropped or the order is reset.</param>
+        /// <param name="floatingMode">Current 悬浮模式 state (yaml null = the off default).</param>
+        /// <param name="floatingChanged">Reported with the requested on/off — App rebuilds the
+        /// overlay window in its other form (taskbar child ⟷ desktop widget).</param>
+        /// <param name="floatingTopmost">Current 置顶显示 state (yaml null = the on default);
+        /// floating form only.</param>
+        /// <param name="floatingTopmostChanged">Reported with the requested on/off — applied
+        /// live (no rebuild).</param>
+        /// <param name="floatingEdgeHide">Current 贴边隐藏 state (yaml null = the off
+        /// default); floating form only.</param>
+        /// <param name="floatingEdgeHideChanged">Reported with the requested on/off — applied
+        /// live (the taskbar thread re-derives the dock from the home position).</param>
+        /// <param name="floatingFullscreenHide">Current 全屏时隐藏 state (yaml null = the on
+        /// default); floating form only.</param>
+        /// <param name="floatingFullscreenHideChanged">Reported with the requested on/off —
+        /// applied live (the taskbar thread's fullscreen probe runs at once, then per
+        /// tick).</param>
+        /// <param name="floatingOpacity">Current 透明度 as 0.2–1.0 (yaml null = 1.0, the
+        /// default); floating form only.</param>
+        /// <param name="floatingOpacityChanged">Reported with the new 0.2–1.0 opacity on every
+        /// slider step — App re-tints the widget live and persists debounced.</param>
+        /// <param name="intervalMs">Current sampling interval (500/1000/2000).</param>
+        /// <param name="intervalChanged">Reported with the new interval in ms.</param>
+        /// <param name="samplingMask">Current per-metric sampling mask (SystemSampler.Mask*
+        /// bits, in overlay hit-slot order).</param>
+        /// <param name="samplingChanged">Reported with (slot, enabled) on every 采样 toggle.</param>
+        /// <param name="mergeSamePath">Current 合并相同程序 state (yaml null = the on default).</param>
+        /// <param name="diskDisplayIndex">Current 磁盘显示方式 combo index: 0=所有磁盘平均
+        /// (yaml null) 1=最高利用率 2=特定磁盘.</param>
+        /// <param name="pickedDiskIndex">The PhysicalDrive index the 特定磁盘 picker shows
+        /// selected (yaml null = disk 0).</param>
+        /// <param name="disks">The currently present physical disks (from the latest
+        /// snapshot; null/empty when disk sampling is off) — the picker's items.</param>
+        /// <param name="diskDisplayChanged">Reported with (modeIndex, PhysicalDrive index)
+        /// on every 显示方式 / 特定磁盘 change.</param>
+        /// <param name="gpuDisplayIndex">Current GPU 显示方式 combo index: 0=所有 GPU 平均
+        /// 1=最高利用率 (yaml null, the default) 2=特定 GPU.</param>
+        /// <param name="pickedGpuIndex">The "GPU N" number the 特定 GPU picker shows selected
+        /// (yaml null = GPU 0).</param>
+        /// <param name="gpus">The currently present GPU adapters (from the latest snapshot;
+        /// null/empty when GPU sampling is off) — the picker's items.</param>
+        /// <param name="gpuDisplayChanged">Reported with (modeIndex, "GPU N" number) on
+        /// every 显示方式 / 特定 GPU change.</param>
+        /// <param name="gpuContentIndex">0=使用率 (yaml null, the default) 1=温度
+        /// 2=使用率+温度 — the 任务栏显示 combo.</param>
+        /// <param name="pickedGpuTempIndex">The 温度来源 pick: -1 = 最高温度 (yaml null,
+        /// the default), ≥0 = that "GPU N" number.</param>
+        /// <param name="gpuTempUnitIndex">0=摄氏度 (yaml null, the default) 1=华氏度.</param>
+        /// <param name="gpuTaskbarContentChanged">Reported with (contentIndex, 温度来源
+        /// pick, 华氏度) on every 任务栏显示 / 温度来源 / 温度单位 change.</param>
+        /// <param name="netAdapterId">The pinned adapter's NetworkInterface.Id (GUID);
+        /// null/empty = 自动.</param>
+        /// <param name="netAdapterName">The pinned adapter's display name, for the
+        /// （未连接） placeholder when it's absent.</param>
+        /// <param name="adapters">Every non-loopback adapter (Id + "Description (Name)"
+        /// label), enumerated by App on settings open — the combo's items.</param>
+        /// <param name="netAdapterChanged">Reported with (adapter Id or "" = 自动, its
+        /// display name) on every 适配器 change.</param>
+        /// <param name="publicIpLookupOn">The 公网 IP lookup switch state (yaml null = the
+        /// on default).</param>
+        /// <param name="publicIpLookupChanged">Reported with the requested on/off — takes
+        /// effect live (the poll thread drops its cached address and stops BOTH the HTTP
+        /// lookups and the 公网延迟 ICMP probe).</param>
+        /// <param name="clashEnabled">The Clash/Mihomo integration switch state (yaml
+        /// null = the on default).</param>
+        /// <param name="clashApiAddress">The Clash/Mihomo controller address
+        /// (host:port); null/empty = the 127.0.0.1:9090 default.</param>
+        /// <param name="clashApiSecret">The controller's API secret; null/empty = none.</param>
+        /// <param name="clashApiChanged">Reported with (enabled, address or "" = default,
+        /// secret) — the switch reports immediately, text edits debounced 500ms.</param>
+        /// <param name="updateCheckOn">Current 检查更新 state (yaml null = the on default).</param>
+        /// <param name="updateCheckChanged">Reported with the requested on/off — takes
+        /// effect on the next startup (the check runs once per launch).</param>
+        /// <param name="updateSourceIndex">0=CNB (yaml null, the default) 1=GitHub.</param>
+        /// <param name="snapshotProvider">Reads TaskbarWindow's LatestSnapshot (App's
+        /// lambda) — the About page's live CPU waveform.</param>
+        // internal: the signature mentions internal sampler types — App (same assembly) is
+        // the only caller; the window is never instantiated from XAML.
+        internal SettingsWindow(bool overlayOnLeft, bool snapToStart, Action<bool, bool> placementChanged,
+            bool snapToStartSupported,
+            IReadOnlyList<TaskbarDisplayInfo> displays,
+            IReadOnlyList<TaskbarDisplaySelection> selectedDisplays,
+            Action<IReadOnlyList<TaskbarDisplaySelection>> displaySelectionChanged,
+            bool autoStartOn, Action<bool> autoStartChanged,
+            int themeIndex, Action<int> themeChanged, string accent, Action<string> accentChanged,
+            int? paneWidth, Action<int> paneWidthChanged,
+            bool compactLayout, Action<bool> compactLayoutChanged,
+            bool showSeparators, Action<bool> showSeparatorsChanged,
+            IReadOnlyList<int> itemOrder, IReadOnlyList<int> defaultItemOrder,
+            IReadOnlyDictionary<int, string> pluginNames, Action<IReadOnlyList<int>> itemOrderChanged,
+            bool floatingMode, Action<bool> floatingChanged,
+            bool floatingTopmost, Action<bool> floatingTopmostChanged,
+            bool floatingAllowOutOfBounds, Action<bool> floatingAllowOutOfBoundsChanged,
+            bool floatingEdgeHide, Action<bool> floatingEdgeHideChanged,
+            bool floatingFullscreenHide, Action<bool> floatingFullscreenHideChanged,
+            double floatingOpacity, Action<double> floatingOpacityChanged,
+            int intervalMs, Action<int> intervalChanged,
+            int samplingMask, Action<int, bool> samplingChanged,
+            PluginManagerView pluginManager,
+            bool mergeSamePath, Action<bool> mergeSamePathChanged,
+            int diskDisplayIndex, int pickedDiskIndex, IReadOnlyList<DiskInfo> disks,
+            Action<int, int> diskDisplayChanged,
+            int gpuDisplayIndex, int pickedGpuIndex, IReadOnlyList<GpuInfo> gpus,
+            Action<int, int> gpuDisplayChanged,
+            int gpuContentIndex, int pickedGpuTempIndex, int gpuTempUnitIndex,
+            Action<int, int, bool> gpuTaskbarContentChanged,
+            string netAdapterId, string netAdapterName,
+            IReadOnlyList<(string Id, string Label)> adapters,
+            Action<string, string> netAdapterChanged,
+            bool publicIpLookupOn, Action<bool> publicIpLookupChanged,
+            bool clashEnabled, string clashApiAddress, string clashApiSecret,
+            Action<bool, string, string> clashApiChanged,
+            Func<SystemSnapshot> snapshotProvider)
+        {
+            InitializeComponent();
+            _placementChanged = placementChanged;
+            _displaySelectionChanged = displaySelectionChanged;
+            _autoStartChanged = autoStartChanged;
+            _themeChanged = themeChanged;
+            _accentChanged = accentChanged;
+            _paneWidthChanged = paneWidthChanged;
+            NavView.OpenPaneLength = ClampPaneWidth(paneWidth ?? DefaultPaneWidth);
+            _compactChanged = compactLayoutChanged;
+            _showSeparatorsChanged = showSeparatorsChanged;
+            _itemOrderChanged = itemOrderChanged;
+            _floatingChanged = floatingChanged;
+            _floatingTopmostChanged = floatingTopmostChanged;
+            _floatingOutOfBoundsChanged = floatingAllowOutOfBoundsChanged;
+            _floatingEdgeHideChanged = floatingEdgeHideChanged;
+            _floatingFullscreenHideChanged = floatingFullscreenHideChanged;
+            _floatingOpacityChanged = floatingOpacityChanged;
+            _intervalChanged = intervalChanged;
+            _samplingChanged = samplingChanged;
+            _pluginManager = pluginManager;
+            PluginManagerHost.Child = _pluginManager;
+            _mergeSamePathChanged = mergeSamePathChanged;
+            _diskDisplayChanged = diskDisplayChanged;
+            _gpuDisplayChanged = gpuDisplayChanged;
+            _gpuTaskbarContentChanged = gpuTaskbarContentChanged;
+            _netAdapterChanged = netAdapterChanged;
+            _publicIpLookupChanged = publicIpLookupChanged;
+            _clashApiChanged = clashApiChanged;
+            _snapshotProvider = snapshotProvider;
+
+            OnLeftSwitch.IsOn = overlayOnLeft;
+            AnchorCombo.SelectedIndex = snapToStart ? 1 : 0;
+            AnchorCombo.IsEnabled = overlayOnLeft;   // the anchor only matters while 靠左 is on
+            // Classical (Win10) taskbar: 靠左 has a single spot (the task-buttons band's
+            // end next to Start), so 靠左位置 does not exist and the expander would offer
+            // a chevron opening onto nothing — 靠左显示 renders as a plain card instead
+            // (OnLeftCard). Its icon and its ToggleSwitch MOVE over, so there is exactly
+            // one switch and one piece of state; the expander's two properties are
+            // cleared first, or its template would claim the same children the moment it
+            // applies.
+            _onLeftHost = OnLeftExpander;
+            if (!snapToStartSupported)
+            {
+                var icon = OnLeftExpander.HeaderIcon;
+                OnLeftExpander.HeaderIcon = null;
+                OnLeftExpander.Content = null;
+                OnLeftCard.HeaderIcon = icon;
+                OnLeftCard.Content = OnLeftSwitch;
+                OnLeftExpander.Visibility = Visibility.Collapsed;
+                OnLeftCard.Visibility = Visibility.Visible;
+                _onLeftHost = OnLeftCard;
+            }
+            PopulateDisplayPicker(displays, selectedDisplays);
+            AutoStartSwitch.IsOn = autoStartOn;
+            ThemeCombo.SelectedIndex = themeIndex < 0 || themeIndex > 2 ? 0 : themeIndex;
+            InitializeAccentSwatches(accent);
+            CompactSwitch.IsOn = compactLayout;
+            ShowSeparatorsSwitch.IsOn = showSeparators;
+            UpdateItemOrder(itemOrder, defaultItemOrder, pluginNames);
+            FloatingSwitch.IsOn = floatingMode;
+            FloatingTopmostSwitch.IsOn = floatingTopmost;
+            // 置顶显示 only means anything in the floating form (the embedded overlay inherits
+            // the taskbar's band), so it follows the mode switch — same shape as 靠左位置.
+            FloatingTopmostCard.IsEnabled = floatingMode;
+            FloatingOutOfBoundsSwitch.IsOn = floatingAllowOutOfBounds;
+            FloatingOutOfBoundsCard.IsEnabled = floatingMode;
+            // …and so does 贴边隐藏 (the embedded overlay is anchored to the taskbar; it has
+            // no edges to dock to).
+            FloatingEdgeHideSwitch.IsOn = floatingEdgeHide;
+            FloatingEdgeHideCard.IsEnabled = floatingMode;
+            // …and so does 全屏时隐藏 (the embedded overlay sits in the taskbar, which a
+            // fullscreen app covers on its own).
+            FloatingFullscreenHideSwitch.IsOn = floatingFullscreenHide;
+            FloatingFullscreenHideCard.IsEnabled = floatingMode;
+            // …and so does 透明度 (the embedded overlay must match the opaque taskbar surface).
+            // The slider stores whole percents (snapped); the ctor hands App back a 0.2–1.0
+            // double. The readout text is set here because the guarded handler skips it.
+            FloatingOpacitySlider.Value = Math.Round(Math.Min(1.0, Math.Max(0.2, floatingOpacity)) * 100);
+            FloatingOpacityText.Text = $"{FloatingOpacitySlider.Value:0}%";
+            FloatingOpacityCard.IsEnabled = floatingMode;
+            // …and the two are mutually exclusive: a floating widget is positioned by dragging,
+            // not by the taskbar anchors, so 靠左显示/靠左位置 do nothing while it is on.
+            _onLeftHost.IsEnabled = !floatingMode;
+            DisplayExpander.IsEnabled = !floatingMode;
+            IntervalCombo.SelectedIndex = IntervalToIndex(intervalMs);
+            CpuSwitch.IsOn = (samplingMask & SystemSampler.MaskCpu) != 0;
+            RamSwitch.IsOn = (samplingMask & SystemSampler.MaskRam) != 0;
+            DiskSwitch.IsOn = (samplingMask & SystemSampler.MaskDisk) != 0;
+            GpuSwitch.IsOn = (samplingMask & SystemSampler.MaskGpu) != 0;
+            NetSwitch.IsOn = (samplingMask & SystemSampler.MaskNet) != 0;
+            MergeSwitch.IsOn = mergeSamePath;
+            DiskDisplayCombo.SelectedIndex = diskDisplayIndex < 0 || diskDisplayIndex > 2 ? 0 : diskDisplayIndex;
+            PopulateDiskPicker(disks, pickedDiskIndex);
+            DiskPickCombo.IsEnabled = DiskDisplayCombo.SelectedIndex == 2;
+            GpuDisplayCombo.SelectedIndex = gpuDisplayIndex < 0 || gpuDisplayIndex > 2 ? 1 : gpuDisplayIndex;
+            PopulateGpuPicker(gpus, pickedGpuIndex);
+            GpuPickCombo.IsEnabled = GpuDisplayCombo.SelectedIndex == 2;
+            // 任务栏显示 + its two temperature sub-cards; the sub-cards are enabled only
+            // while a temperature actually shows (the DiskPickCombo pattern).
+            GpuContentCombo.SelectedIndex = gpuContentIndex < 0 || gpuContentIndex > 2 ? 0 : gpuContentIndex;
+            PopulateGpuTempPicker(gpus, pickedGpuTempIndex);
+            GpuTempUnitCombo.SelectedIndex = gpuTempUnitIndex == 1 ? 1 : 0;
+            GpuTempPickCombo.IsEnabled = GpuContentCombo.SelectedIndex != 0;
+            GpuTempUnitCombo.IsEnabled = GpuContentCombo.SelectedIndex != 0;
+            PopulateNetAdapterPicker(adapters, netAdapterId, netAdapterName);
+            PublicIpSwitch.IsOn = publicIpLookupOn;
+            ClashSwitch.IsOn = clashEnabled;
+            ClashAddressBox.Text = clashApiAddress ?? "";
+            ClashSecretBox.Text = clashApiSecret ?? "";
+            SetClashInputsEnabled(clashEnabled);
+            VersionText.Text = $"版本 {VersionInfo.Current}";   // AssemblyInformationalVersion — 与发版 tag 一致
+            _loaded = true;
+        }
+
+        internal void UpdateItemOrder(IReadOnlyList<int> order, IReadOnlyList<int> defaults,
+            IReadOnlyDictionary<int, string> pluginNames)
+        {
+            _defaultItemOrder = defaults;
+            _pluginNames = pluginNames;
+            PopulateItemOrder(order);
+        }
+
+        private void PopulateItemOrder(IReadOnlyList<int> order)
+        {
+            _itemOrderItems.Clear();
+            var cards = new List<object>();
+            foreach (int slot in order)
+            {
+                var item = new MetricOrderItem { Slot = slot, Name = ItemOrderName(slot) };
+                _itemOrderItems.Add(item);
+                var handle = new FontIcon { Icon = FluentSystemIcons.ReOrderDotsVertical_20_Regular, FontSize = 16 };
+                TouchDragScrollViewer.SetTouchDragExcluded(handle, true);
+                var card = new SettingsCard
+                {
+                    Header = item.Name,
+                    HeaderIcon = handle,
+                    DataContext = item,
+                    AllowDrop = true,
+                    Cursor = Cursors.Hand,
+                };
+                card.PreviewMouseLeftButtonDown += ItemOrderCard_PreviewMouseLeftButtonDown;
+                card.PreviewMouseMove += ItemOrderCard_PreviewMouseMove;
+                card.DragEnter += ItemOrderCard_DragEnter;
+                card.DragOver += ItemOrderCard_DragOver;
+                card.Drop += ItemOrderCard_Drop;
+                cards.Add(card);
+            }
+            // SettingsExpander's ItemsRepeater observes replacement, not mutations of the old list.
+            ItemOrderExpander.Items = cards;
+        }
+
+        private string ItemOrderName(int slot)
+        {
+            switch (slot)
+            {
+                case 0: return "CPU";
+                case 1: return "内存";
+                case 2: return "磁盘";
+                case 3: return "GPU";
+                case 4: return "网络";
+                default: return _pluginNames.TryGetValue(slot, out var name) ? name : string.Empty;
+            }
+        }
+
+        private int[] CurrentItemOrder()
+        {
+            var order = new int[_itemOrderItems.Count];
+            for (int i = 0; i < order.Length; i++) order[i] = _itemOrderItems[i].Slot;
+            return order;
+        }
+
+        private void ReportItemOrder() => _itemOrderChanged?.Invoke(CurrentItemOrder());
+
+        private void ResetItemOrder_Click(object sender, RoutedEventArgs e)
+        {
+            PopulateItemOrder(_defaultItemOrder);
+            ReportItemOrder();
+        }
+
+        private static SettingsCard ItemOrderCardFrom(DependencyObject source)
+        {
+            while (source != null)
+            {
+                if (source is SettingsCard card) return card;
+                source = VisualTreeHelper.GetParent(source);
+            }
+            return null;
+        }
+
+        private static bool IsItemOrderTouchHandle(DependencyObject source)
+        {
+            while (source != null && !(source is SettingsCard))
+            {
+                if (TouchDragScrollViewer.GetTouchDragExcluded(source)) return true;
+                source = VisualTreeHelper.GetParent(source);
+            }
+            return false;
+        }
+
+        private void ItemOrderCard_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            var source = e.OriginalSource as DependencyObject;
+            _dragItem = e.StylusDevice != null && !IsItemOrderTouchHandle(source)
+                ? null
+                : ItemOrderCardFrom(source)?.DataContext as MetricOrderItem;
+            _dragStart = e.GetPosition(ItemOrderExpander);
+        }
+
+        private void ItemOrderCard_PreviewMouseMove(object sender, MouseEventArgs e)
+        {
+            if (_dragItem == null) return;
+            if (e.LeftButton != MouseButtonState.Pressed) { _dragItem = null; return; }
+            Vector delta = e.GetPosition(ItemOrderExpander) - _dragStart;
+            if (Math.Abs(delta.X) < SystemParameters.MinimumHorizontalDragDistance
+                && Math.Abs(delta.Y) < SystemParameters.MinimumVerticalDragDistance) return;
+            var data = new DataObject(typeof(MetricOrderItem), _dragItem);
+            try { DragDrop.DoDragDrop(ItemOrderExpander, data, DragDropEffects.Move); }
+            finally { _dragItem = null; }
+        }
+
+        private void ItemOrderCard_DragEnter(object sender, DragEventArgs e)
+            => ItemOrderCard_DragOver(sender, e);
+
+        private void ItemOrderCard_DragOver(object sender, DragEventArgs e)
+        {
+            bool reorder = e.Data.GetDataPresent(typeof(MetricOrderItem));
+            e.Effects = reorder ? DragDropEffects.Move : DragDropEffects.None;
+            e.Handled = true;
+        }
+
+        private void ItemOrderCard_Drop(object sender, DragEventArgs e)
+        {
+            var source = e.Data.GetData(typeof(MetricOrderItem)) as MetricOrderItem;
+            var target = ItemOrderCardFrom(e.OriginalSource as DependencyObject)?.DataContext as MetricOrderItem;
+            if (source == null || target == null || ReferenceEquals(source, target)) return;
+            int oldIndex = _itemOrderItems.IndexOf(source);
+            int newIndex = _itemOrderItems.IndexOf(target);
+            if (oldIndex < 0 || newIndex < 0 || oldIndex == newIndex) return;
+            _itemOrderItems.RemoveAt(oldIndex);
+            _itemOrderItems.Insert(newIndex, source);
+            int[] order = CurrentItemOrder();
+            PopulateItemOrder(order);
+            _itemOrderChanged?.Invoke(order);
+            e.Handled = true;
+        }
+
+        private void PopulateDisplayPicker(IReadOnlyList<TaskbarDisplayInfo> displays,
+            IReadOnlyList<TaskbarDisplaySelection> selectedDisplays)
+        {
+            var cards = new List<object>();
+            var selectedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (selectedDisplays != null)
+            {
+                foreach (var selected in selectedDisplays)
+                {
+                    if (selected != null && !string.IsNullOrWhiteSpace(selected.Id)) selectedIds.Add(selected.Id);
+                }
+            }
+
+            if (displays != null)
+            {
+                foreach (var display in displays)
+                {
+                    if (display == null || string.IsNullOrWhiteSpace(display.Id)) continue;
+                    bool selected = selectedDisplays == null ? display.IsPrimary : selectedIds.Contains(display.Id);
+                    AddDisplayCard(cards, display.Id, display.Name, display.DeviceName, display.IsPrimary,
+                        display.HasTaskbar, selected, false);
+                    seen.Add(display.Id);
+                }
+            }
+
+            if (selectedDisplays != null)
+            {
+                foreach (var selected in selectedDisplays)
+                {
+                    if (selected == null || string.IsNullOrWhiteSpace(selected.Id) || seen.Contains(selected.Id)) continue;
+                    AddDisplayCard(cards, selected.Id, TaskbarDisplayCatalog.ResolveDisplayName(selected.Id, selected.Name),
+                        null, false, false, true, true);
+                    seen.Add(selected.Id);
+                }
+            }
+            DisplayExpander.Items = cards;
+            if (CountCheckedDisplays() == 0)
+            {
+                foreach (var item in DisplayExpander.Items)
+                {
+                    if (item is SettingsCard card && card.Content is CheckBox check && check.IsEnabled)
+                    {
+                        check.IsChecked = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        internal void RefreshDisplays(IReadOnlyList<TaskbarDisplayInfo> displays,
+            IReadOnlyList<TaskbarDisplaySelection> selectedDisplays)
+        {
+            bool wasLoaded = _loaded;
+            _loaded = false;
+            PopulateDisplayPicker(displays, selectedDisplays);
+            DisplayExpander.UpdateLayout();
+            _loaded = wasLoaded;
+            Logger.Debug($"设置显示器列表已重建：在线={displays?.Count ?? 0}，保存选择={selectedDisplays?.Count ?? 0}");
+        }
+
+        private void AddDisplayCard(List<object> cards, string id, string name, string deviceName, bool primary,
+            bool hasTaskbar, bool selected, bool offline)
+        {
+            var selection = new TaskbarDisplaySelection
+            {
+                Id = id,
+                Name = string.IsNullOrWhiteSpace(name) ? "显示器" : name
+            };
+            var check = new CheckBox
+            {
+                Content = selection.Name,
+                Tag = selection,
+                IsChecked = selected,
+                IsEnabled = hasTaskbar || selected,
+                HorizontalAlignment = HorizontalAlignment.Left
+            };
+            check.Checked += DisplayCheckChanged;
+            check.Unchecked += DisplayCheckChanged;
+            string title = selection.Name;
+            if (primary) title += "（主显示器）";
+            if (offline) title += "（未连接）";
+            string description = offline
+                ? "保留此选择，重新连接后自动恢复。"
+                : hasTaskbar ? deviceName : "当前没有任务栏；请在 Windows 中开启“在所有显示器上显示任务栏”。";
+            cards.Add(new SettingsCard
+            {
+                Header = title,
+                Description = description,
+                Content = check
+            });
+        }
+
+        private void DisplayCheckChanged(object sender, RoutedEventArgs e)
+        {
+            if (!_loaded || !(sender is CheckBox changed)) return;
+            if (changed.IsChecked != true && CountCheckedDisplays() == 0)
+            {
+                _loaded = false;
+                changed.IsChecked = true;
+                _loaded = true;
+                return;
+            }
+            var selected = new List<TaskbarDisplaySelection>();
+            foreach (var item in DisplayExpander.Items)
+            {
+                if (item is SettingsCard card && card.Content is CheckBox check
+                    && check.IsChecked == true && check.Tag is TaskbarDisplaySelection display)
+                {
+                    selected.Add(new TaskbarDisplaySelection { Id = display.Id, Name = display.Name });
+                }
+            }
+            _displaySelectionChanged?.Invoke(selected);
+        }
+
+        private int CountCheckedDisplays()
+        {
+            int count = 0;
+            foreach (var item in DisplayExpander.Items)
+            {
+                if (item is SettingsCard card && card.Content is CheckBox check && check.IsChecked == true) count++;
+            }
+            return count;
+        }
+
+        // The 特定磁盘 picker: one item per present physical disk ("磁盘 0 (C: D:) · model"),
+        // Tag = the PhysicalDrive index. A stored pick whose disk is currently absent (or
+        // a list that came back empty — disk sampling off) still gets a （未连接） item so
+        // the user's choice stays visible instead of silently snapping to another disk.
+        private void PopulateDiskPicker(IReadOnlyList<DiskInfo> disks, int selectedIndex)
+        {
+            int sel = -1;
+            if (disks != null)
+            {
+                foreach (var d in disks)
+                {
+                    var item = new ComboBoxItem { Content = $"{d.TabTitle} · {d.Name}", Tag = d.Index };
+                    DiskPickCombo.Items.Add(item);
+                    if (d.Index == selectedIndex) sel = DiskPickCombo.Items.Count - 1;
+                }
+            }
+            if (sel < 0)
+            {
+                DiskPickCombo.Items.Add(new ComboBoxItem
+                {
+                    Content = $"磁盘 {selectedIndex}（未连接）",
+                    Tag = selectedIndex,
+                });
+                sel = DiskPickCombo.Items.Count - 1;
+            }
+            DiskPickCombo.SelectedIndex = sel;
+        }
+
+        private int PickedDiskIndex()
+            => (DiskPickCombo.SelectedItem as ComboBoxItem)?.Tag is int i ? i : 0;
+
+        // The 特定 GPU picker — same shape as the disk one (a missing stored pick gets a
+        // （未连接） placeholder), items are "GPU 0 · NVIDIA …", Tag = the "GPU N" number.
+        private void PopulateGpuPicker(IReadOnlyList<GpuInfo> gpus, int selectedIndex)
+        {
+            int sel = -1;
+            if (gpus != null)
+            {
+                foreach (var g in gpus)
+                {
+                    var item = new ComboBoxItem { Content = $"{g.TabTitle} · {g.Name}", Tag = g.Index };
+                    GpuPickCombo.Items.Add(item);
+                    if (g.Index == selectedIndex) sel = GpuPickCombo.Items.Count - 1;
+                }
+            }
+            if (sel < 0)
+            {
+                GpuPickCombo.Items.Add(new ComboBoxItem
+                {
+                    Content = $"GPU {selectedIndex}（未连接）",
+                    Tag = selectedIndex,
+                });
+                sel = GpuPickCombo.Items.Count - 1;
+            }
+            GpuPickCombo.SelectedIndex = sel;
+        }
+
+        private int PickedGpuIndex()
+            => (GpuPickCombo.SelectedItem as ComboBoxItem)?.Tag is int i ? i : 0;
+
+        // The 温度来源 picker: 最高温度（默认） first (Tag = -1 — the sampler's "hottest
+        // adapter" sentinel), then one item per present GPU (Tag = the "GPU N" number) —
+        // the same items as the 特定 GPU picker. A stored pick that's currently absent (or
+        // GPU sampling off) keeps a （未连接） placeholder, same contract as the other two.
+        private void PopulateGpuTempPicker(IReadOnlyList<GpuInfo> gpus, int selectedIndex)
+        {
+            GpuTempPickCombo.Items.Add(new ComboBoxItem { Content = "最高温度（默认）", Tag = -1 });
+            int sel = 0;
+            if (gpus != null)
+            {
+                foreach (var g in gpus)
+                {
+                    var item = new ComboBoxItem { Content = $"{g.TabTitle} · {g.Name}", Tag = g.Index };
+                    GpuTempPickCombo.Items.Add(item);
+                    if (g.Index == selectedIndex) sel = GpuTempPickCombo.Items.Count - 1;
+                }
+            }
+            if (sel == 0 && selectedIndex >= 0)
+            {
+                GpuTempPickCombo.Items.Add(new ComboBoxItem
+                {
+                    Content = $"GPU {selectedIndex}（未连接）",
+                    Tag = selectedIndex,
+                });
+                sel = GpuTempPickCombo.Items.Count - 1;
+            }
+            GpuTempPickCombo.SelectedIndex = sel;
+        }
+
+        private int PickedGpuTempIndex()
+            => (GpuTempPickCombo.SelectedItem as ComboBoxItem)?.Tag is int i ? i : -1;
+
+        // The 网络 适配器 combo: "自动（默认）" first (Tag = ""), then one item per
+        // enumerated non-loopback adapter (Tag = its Id). A stored pick whose adapter is
+        // absent keeps a （未连接） placeholder — same contract as the disk/GPU pickers.
+        private void PopulateNetAdapterPicker(IReadOnlyList<(string Id, string Label)> adapters,
+            string selectedId, string selectedName)
+        {
+            NetAdapterCombo.Items.Add(new ComboBoxItem { Content = "自动（默认）", Tag = "" });
+            int sel = 0;
+            if (adapters != null)
+            {
+                foreach (var (id, label) in adapters)
+                {
+                    NetAdapterCombo.Items.Add(new ComboBoxItem { Content = label, Tag = id });
+                    if (!string.IsNullOrEmpty(selectedId) && id == selectedId)
+                        sel = NetAdapterCombo.Items.Count - 1;
+                }
+            }
+            if (sel == 0 && !string.IsNullOrEmpty(selectedId))
+            {
+                NetAdapterCombo.Items.Add(new ComboBoxItem
+                {
+                    Content = $"{(string.IsNullOrEmpty(selectedName) ? "未知适配器" : selectedName)}（未连接）",
+                    Tag = selectedId,
+                });
+                sel = NetAdapterCombo.Items.Count - 1;
+            }
+            NetAdapterCombo.SelectedIndex = sel;
+        }
+
+        private static int IntervalToIndex(int ms) => ms <= 500 ? 0 : ms >= 2000 ? 2 : 1;
+        private static int IndexToInterval(int index) => index == 0 ? 500 : index == 2 ? 2000 : 1000;
+
+        /// <summary>App pushes the real task state back after a failed schtasks call,
+        /// without re-firing the change callback.</summary>
+        public void SyncAutoStart(bool on)
+        {
+            _loaded = false;
+            AutoStartSwitch.IsOn = on;
+            _loaded = true;
+        }
+
+        /// <summary>悬浮模式 was flipped from the taskbar right-click menu: push the state
+        /// back (incl. the sub-card enablement the Toggled handler maintains) without
+        /// re-firing the change callback.</summary>
+        public void SyncFloatingMode(bool on)
+        {
+            _loaded = false;
+            FloatingSwitch.IsOn = on;
+            FloatingTopmostCard.IsEnabled = on;
+            FloatingOutOfBoundsCard.IsEnabled = on;
+            FloatingEdgeHideCard.IsEnabled = on;
+            FloatingFullscreenHideCard.IsEnabled = on;
+            FloatingOpacityCard.IsEnabled = on;
+            _onLeftHost.IsEnabled = !on;
+            DisplayExpander.IsEnabled = !on;
+            _loaded = true;
+        }
+
+        /// <summary>置顶显示 was flipped from the taskbar right-click menu, without
+        /// re-firing the change callback.</summary>
+        public void SyncFloatingTopmost(bool on)
+        {
+            _loaded = false;
+            FloatingTopmostSwitch.IsOn = on;
+            _loaded = true;
+        }
+
+        /// <summary>贴边隐藏 was flipped from the taskbar right-click menu, without
+        /// re-firing the change callback.</summary>
+        public void SyncFloatingEdgeHide(bool on)
+        {
+            _loaded = false;
+            FloatingEdgeHideSwitch.IsOn = on;
+            _loaded = true;
+        }
+
+        /// <summary>全屏时隐藏 was flipped from the taskbar right-click menu, without
+        /// re-firing the change callback.</summary>
+        public void SyncFloatingFullscreenHide(bool on)
+        {
+            _loaded = false;
+            FloatingFullscreenHideSwitch.IsOn = on;
+            _loaded = true;
+        }
+
+        /// <summary>紧凑模式 was flipped from the taskbar right-click menu, without
+        /// re-firing the change callback.</summary>
+        public void SyncCompactLayout(bool on)
+        {
+            _loaded = false;
+            CompactSwitch.IsOn = on;
+            _loaded = true;
+        }
+
+        private void CompactSwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!_loaded) return;
+            _compactChanged?.Invoke(CompactSwitch.IsOn);
+        }
+
+        private void ShowSeparatorsSwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!_loaded) return;
+            _showSeparatorsChanged?.Invoke(ShowSeparatorsSwitch.IsOn);
+        }
+
+        private void OnLeftSwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!_loaded) return;
+            AnchorCombo.IsEnabled = OnLeftSwitch.IsOn;
+            _placementChanged?.Invoke(OnLeftSwitch.IsOn, AnchorCombo.SelectedIndex == 1);
+        }
+
+        private void AnchorCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_loaded) return;
+            _placementChanged?.Invoke(OnLeftSwitch.IsOn, AnchorCombo.SelectedIndex == 1);
+        }
+
+        private void AutoStartSwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!_loaded) return;
+            _autoStartChanged?.Invoke(AutoStartSwitch.IsOn);
+        }
+
+        private void ThemeCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_loaded) return;
+            _themeChanged?.Invoke(ThemeCombo.SelectedIndex);
+        }
+
+        private void InitializeAccentSwatches(string selectedId)
+        {
+            var system = new AccentSwatch(null, "跟随系统强调色", _systemAccentBrush);
+            var choices = new[] { system }.Concat(AccentPalette.Presets.Select(preset =>
+                new AccentSwatch(preset.Id, preset.Name, new SolidColorBrush(preset.Color)))).ToArray();
+            AccentSwatches.ItemsSource = choices;
+            AccentSwatches.SelectedItem = choices.FirstOrDefault(choice => choice.Id == selectedId) ?? system;
+            UpdateSystemAccentPreview();
+            ColorsHelper.Current.SystemAccentColorChanged += OnSystemAccentColorChanged;
+            Closed += (sender, e) => ColorsHelper.Current.SystemAccentColorChanged -= OnSystemAccentColorChanged;
+        }
+
+        private void OnSystemAccentColorChanged(object sender, EventArgs e)
+        {
+            if (Dispatcher.CheckAccess()) UpdateSystemAccentPreview();
+            else Dispatcher.BeginInvoke(new Action(UpdateSystemAccentPreview));
+        }
+
+        private void UpdateSystemAccentPreview()
+        {
+            var accent = ColorsHelper.Current.SystemAccentColor;
+            _systemAccentBrush.Color = accent;
+            SystemAccentCaption.Text = $"系统强调色  #{accent.R:X2}{accent.G:X2}{accent.B:X2}";
+        }
+
+        private void AccentSwatches_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_loaded || !ReferenceEquals(e.Source, AccentSwatches)) return;
+            if (AccentSwatches.SelectedItem is AccentSwatch option)
+                _accentChanged?.Invoke(option.Id);
+            else if (e.RemovedItems.Count > 0)
+                AccentSwatches.SelectedItem = e.RemovedItems[0];
+        }
+
+        private sealed class AccentSwatch
+        {
+            public AccentSwatch(string id, string name, Brush brush)
+            {
+                Id = id;
+                Name = name;
+                Brush = brush;
+            }
+            public string Id { get; }
+            public string Name { get; }
+            public Brush Brush { get; }
+        }
+
+        internal static double ClampPaneWidth(double width) => Math.Max(MinPaneWidth, Math.Min(MaxPaneWidth, width));
+
+        private void PaneResize_DragStarted(object sender, DragStartedEventArgs e)
+        {
+            _paneDragStart = NavView.OpenPaneLength;
+            _panePointerStart = Mouse.GetPosition(NavView).X;
+        }
+
+        private void PaneResize_DragDelta(object sender, DragDeltaEventArgs e) =>
+            NavView.OpenPaneLength = ClampPaneWidth(_paneDragStart + Mouse.GetPosition(NavView).X - _panePointerStart);
+
+        private void PaneResize_DragCompleted(object sender, DragCompletedEventArgs e)
+        {
+            if (e.Canceled) NavView.OpenPaneLength = _paneDragStart;
+            else SavePaneWidth();
+        }
+
+        private void PaneResize_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key != Key.Left && e.Key != Key.Right) return;
+            NavView.OpenPaneLength = ClampPaneWidth(NavView.OpenPaneLength + (e.Key == Key.Left ? -16 : 16));
+            SavePaneWidth();
+            e.Handled = true;
+        }
+
+        private void SavePaneWidth()
+        {
+            int width = (int)Math.Round(NavView.OpenPaneLength);
+            NavView.OpenPaneLength = width;
+            _paneWidthChanged?.Invoke(width);
+        }
+
+        private void FloatingSwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!_loaded) return;
+            FloatingTopmostCard.IsEnabled = FloatingSwitch.IsOn;
+            FloatingOutOfBoundsCard.IsEnabled = FloatingSwitch.IsOn;
+            FloatingEdgeHideCard.IsEnabled = FloatingSwitch.IsOn;
+            FloatingFullscreenHideCard.IsEnabled = FloatingSwitch.IsOn;
+            FloatingOpacityCard.IsEnabled = FloatingSwitch.IsOn;
+            _onLeftHost.IsEnabled = !FloatingSwitch.IsOn;   // anchors don't apply to a dragged widget
+            DisplayExpander.IsEnabled = !FloatingSwitch.IsOn;
+            _floatingChanged?.Invoke(FloatingSwitch.IsOn);
+        }
+
+        private void FloatingTopmostSwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!_loaded) return;
+            _floatingTopmostChanged?.Invoke(FloatingTopmostSwitch.IsOn);
+        }
+
+        private void FloatingOutOfBoundsSwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!_loaded) return;
+            _floatingOutOfBoundsChanged?.Invoke(FloatingOutOfBoundsSwitch.IsOn);
+        }
+
+        private void FloatingEdgeHideSwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!_loaded) return;
+            _floatingEdgeHideChanged?.Invoke(FloatingEdgeHideSwitch.IsOn);
+        }
+
+        private void FloatingFullscreenHideSwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!_loaded) return;
+            _floatingFullscreenHideChanged?.Invoke(FloatingFullscreenHideSwitch.IsOn);
+        }
+
+        // 悬浮模式 → 透明度 slider: fires per step while dragging, and each step is reported
+        // at once — the widget must re-tint live under the thumb, so no debounce here. App
+        // applies immediately and defers only the settings.yaml write.
+        private void FloatingOpacitySlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            if (!_loaded) return;
+            FloatingOpacityText.Text = $"{FloatingOpacitySlider.Value:0}%";
+            _floatingOpacityChanged?.Invoke(FloatingOpacitySlider.Value / 100.0);
+        }
+
+        private void IntervalCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_loaded) return;
+            _intervalChanged?.Invoke(IndexToInterval(IntervalCombo.SelectedIndex));
+        }
+
+        // 检查更新 toggle: reports immediately (persisted for the NEXT startup's check)
+        // and gates the 更新源 picker (same pattern as the Clash switch).
+        private void MetricSwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!_loaded) return;
+            if (sender is ToggleSwitch sw && int.TryParse(sw.Tag as string, out int slot))
+            {
+                if (!sw.IsOn && !CpuSwitch.IsOn && !RamSwitch.IsOn && !DiskSwitch.IsOn
+                    && !GpuSwitch.IsOn && !NetSwitch.IsOn)
+                {
+                    _loaded = false;
+                    sw.IsOn = true;
+                    _loaded = true;
+                    return;
+                }
+                _samplingChanged?.Invoke(slot, sw.IsOn);
+            }
+        }
+
+        private void MergeSwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!_loaded) return;
+            _mergeSamePathChanged?.Invoke(MergeSwitch.IsOn);
+        }
+
+        // 磁盘 → 显示方式 combo: 0=所有磁盘平均 1=最高利用率 2=特定磁盘 (the picker below
+        // is enabled only in 特定磁盘 mode — the AnchorCombo pattern).
+        private void DiskDisplayCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_loaded) return;
+            DiskPickCombo.IsEnabled = DiskDisplayCombo.SelectedIndex == 2;
+            _diskDisplayChanged?.Invoke(DiskDisplayCombo.SelectedIndex, PickedDiskIndex());
+        }
+
+        private void DiskPickCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_loaded) return;
+            // Re-picking only matters while 特定磁盘 is the active mode.
+            if (DiskDisplayCombo.SelectedIndex != 2) return;
+            _diskDisplayChanged?.Invoke(2, PickedDiskIndex());
+        }
+
+        // GPU → 显示方式 combo: 0=所有 GPU 平均 1=最高利用率 2=特定 GPU (the GPU default is
+        // 最高, unlike the disk's 平均; the picker below is enabled only in 特定 GPU mode).
+        private void GpuDisplayCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_loaded) return;
+            GpuPickCombo.IsEnabled = GpuDisplayCombo.SelectedIndex == 2;
+            _gpuDisplayChanged?.Invoke(GpuDisplayCombo.SelectedIndex, PickedGpuIndex());
+        }
+
+        private void GpuPickCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_loaded) return;
+            // Re-picking only matters while 特定 GPU is the active mode.
+            if (GpuDisplayCombo.SelectedIndex != 2) return;
+            _gpuDisplayChanged?.Invoke(2, PickedGpuIndex());
+        }
+
+        // GPU → 任务栏显示 combo: 0=使用率（默认） 1=温度 2=使用率 + 温度 — 温度 replaces
+        // the utilization row, 两者 packs BOTH rows. The two temperature sub-cards below are
+        // enabled only while a temperature shows (index != 0).
+        private void GpuContentCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_loaded) return;
+            bool tempShows = GpuContentCombo.SelectedIndex != 0;
+            GpuTempPickCombo.IsEnabled = tempShows;
+            GpuTempUnitCombo.IsEnabled = tempShows;
+            _gpuTaskbarContentChanged?.Invoke(GpuContentCombo.SelectedIndex, PickedGpuTempIndex(),
+                GpuTempUnitCombo.SelectedIndex == 1);
+        }
+
+        // GPU → 温度来源 combo: the "-1"-tagged first item is 最高温度; every other item's
+        // Tag is the "GPU N" number. Re-picking only matters while a temperature shows.
+        private void GpuTempPickCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_loaded) return;
+            if (GpuContentCombo.SelectedIndex == 0) return;
+            _gpuTaskbarContentChanged?.Invoke(GpuContentCombo.SelectedIndex, PickedGpuTempIndex(),
+                GpuTempUnitCombo.SelectedIndex == 1);
+        }
+
+        // GPU → 温度单位 combo: 0=摄氏度（默认） 1=华氏度 — applies to the taskbar row AND
+        // the detail popup's temperatures. Only matters while a temperature shows.
+        private void GpuTempUnitCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_loaded) return;
+            if (GpuContentCombo.SelectedIndex == 0) return;
+            _gpuTaskbarContentChanged?.Invoke(GpuContentCombo.SelectedIndex, PickedGpuTempIndex(),
+                GpuTempUnitCombo.SelectedIndex == 1);
+        }
+
+        // 网络 → 适配器 combo: the ""-tagged first item is 自动; every other item's Tag is
+        // the adapter's NetworkInterface.Id. The display name rides along so the picker can
+        // show a （未连接） placeholder for a missing pick later.
+        private void NetAdapterCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_loaded) return;
+            var item = NetAdapterCombo.SelectedItem as ComboBoxItem;
+            string id = item?.Tag as string ?? "";
+            _netAdapterChanged?.Invoke(id, id.Length == 0 ? null : item.Content as string);
+        }
+
+        // The 公网 IP switch: a discrete action, so it reports immediately (same as the
+        // Clash switch) — NetInfoSampler's poll thread stops BOTH the HTTP lookups and
+        // the 公网延迟 ICMP probe, and drops the cached address on off.
+        private void PublicIpSwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!_loaded) return;
+            _publicIpLookupChanged?.Invoke(PublicIpSwitch.IsOn);
+        }
+
+        // The Clash/Mihomo switch: a discrete action, so it reports immediately (the text
+        // boxes debounce instead), and the endpoint inputs follow its state.
+        private void ClashSwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!_loaded) return;
+            SetClashInputsEnabled(ClashSwitch.IsOn);
+            _clashApiChanged?.Invoke(ClashSwitch.IsOn, ClashAddressBox.Text.Trim(), ClashSecretBox.Text.Trim());
+        }
+
+        private void SetClashInputsEnabled(bool on)
+        {
+            ClashAddressBox.IsEnabled = on;
+            ClashSecretBox.IsEnabled = on;
+            ClashTestButton.IsEnabled = on;
+            if (!on) ClashTestResult.Text = "";
+        }
+
+        // Both Clash/Mihomo boxes funnel here per keystroke; the actual report is
+        // debounced 500ms so a yaml write + sampler retarget doesn't fire per character.
+        private void ClashApiBox_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (!_loaded) return;
+            if (_clashDebounce == null)
+            {
+                _clashDebounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+                _clashDebounce.Tick += (s2, e2) =>
+                {
+                    _clashDebounce.Stop();
+                    _clashApiChanged?.Invoke(ClashSwitch.IsOn, ClashAddressBox.Text.Trim(), ClashSecretBox.Text.Trim());
+                };
+            }
+            _clashDebounce.Stop();
+            _clashDebounce.Start();
+        }
+
+        // 测试连接: probes the CURRENT box contents (empty address = the 127.0.0.1:9090
+        // default — the same value the poller would use) via GET /version, off the UI
+        // thread. The result line is colored per outcome (iNKORE scheme brushes).
+        private async void ClashTestButton_Click(object sender, RoutedEventArgs e)
+        {
+            string address = ClashAddressBox.Text.Trim();
+            string secret = ClashSecretBox.Text.Trim();
+            ClashTestButton.IsEnabled = false;
+            ClashTestResult.Text = "测试中…";
+            ClashTestResult.Foreground = (Brush)FindResource("TextFillColorSecondaryBrush");
+            var (ok, detail) = await Task.Run(() => ClashSampler.TestConnection(address, secret));
+            ClashTestResult.Text = detail;
+            ClashTestResult.Foreground = (Brush)FindResource(ok
+                ? "SystemFillColorSuccessBrush" : "SystemFillColorCriticalBrush");
+            ClashTestButton.IsEnabled = true;
+        }
+
+        private const string GitHubUrl = "https://github.com/noxowin/deskmonitor";
+        private const string AcknowledgementsUrl = GitHubUrl + "#来源与许可";
+
+        // The nav pane's 类别 switch. Only ever flips the pages' Visibility —
+        // deliberately without the _loaded guard: it carries no change callback to
+        // App, and it must also run for the selection IsSelected="True" establishes
+        // in XAML (the pages' XAML defaults already match, so the early fire during
+        // InitializeComponent is a no-op there — the null check only covers it firing
+        // before the pages themselves are parsed).
+        private void NavView_SelectionChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
+        {
+            if (AboutPage == null) return;
+            object item = args.SelectedItem;
+            GeneralPage.Visibility = item == NavGeneral ? Visibility.Visible : Visibility.Collapsed;
+            AppearancePage.Visibility = item == NavAppearance ? Visibility.Visible : Visibility.Collapsed;
+            SamplingPage.Visibility = item == NavSampling ? Visibility.Visible : Visibility.Collapsed;
+            PluginsPage.Visibility = item == NavPlugins ? Visibility.Visible : Visibility.Collapsed;
+            AboutPage.Visibility = item == NavAbout ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        internal void ReloadPlugins() => _pluginManager.ReloadCatalog();
+
+        internal void RefreshPluginStatus(PluginSnapshot snapshot) => _pluginManager.RefreshStatus(snapshot);
+
+        // The About page's live CPU waveform. Driven by App's SnapshotChanged pump (the
+        // same push model as the detail windows — this window holds no timer): a no-op
+        // unless the About page is actually showing, and the whole band collapses while
+        // CPU sampling is off (the snapshot's history then stays empty — a flat line at
+        // zero would be a lie). Points map oldest→newest left→right, 2px inset so the
+        // 100% peak never clips.
+        internal void RefreshAbout()
+        {
+            if (AboutPage.Visibility != Visibility.Visible) return;
+            var s = _snapshotProvider?.Invoke();
+            var history = s?.CpuHistory;
+            double w = LiveWave.ActualWidth, h = LiveWave.ActualHeight;
+            if (history == null || history.Length < 2 || w < 10 || h < 10)
+            {
+                LiveBand.Visibility = Visibility.Collapsed;
+                return;
+            }
+            LiveBand.Visibility = Visibility.Visible;
+            LiveCpuText.Text = $"{s.CpuPercent:0}%";
+
+            int n = history.Length;
+            var pts = new Point[n];
+            double step = w / (n - 1);
+            for (int i = 0; i < n; i++)
+            {
+                double v = history[i];
+                if (v < 0) v = 0; else if (v > 100) v = 100;
+                pts[i] = new Point(i * step, h - 2 - v / 100.0 * (h - 4));
+            }
+            LiveLine.Points = new PointCollection(pts);
+
+            // The soft area under the curve (the logo's chart motif) — one StreamGeometry,
+            // frozen so the render thread can share it.
+            var fill = new StreamGeometry();
+            using (var ctx = fill.Open())
+            {
+                ctx.BeginFigure(new Point(0, h), true, true);
+                ctx.PolyLineTo(pts, true, false);
+                ctx.LineTo(new Point(w, h), true, false);
+            }
+            fill.Freeze();
+            LiveFill.Data = fill;
+
+            Canvas.SetLeft(LiveDot, pts[n - 1].X - LiveDot.Width / 2);
+            Canvas.SetTop(LiveDot, pts[n - 1].Y - LiveDot.Height / 2);
+        }
+
+        private void GitHubCard_Click(object sender, RoutedEventArgs e) => OpenUrl(GitHubUrl);
+
+        private void AcknowledgementsCard_Click(object sender, RoutedEventArgs e) => OpenUrl(AcknowledgementsUrl);
+
+        private static void OpenUrl(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url)) return;
+            try { System.Diagnostics.Process.Start(url); }
+            catch { /* no browser handler / malformed url — ignore */ }
+        }
+    }
+}
