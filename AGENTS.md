@@ -97,7 +97,7 @@ All source is under `src/`, grouped **by layer** (`App.*` · `Logger` · `AppSet
 `VersionInfo` · `UpdateChecker` · `StartupTask` at the top, then `Sampling/` · `Interop/` · `UI/`
 with its `Common/` `Details/` `Charts/` `Settings/`); the annotated tree is in
 `docs/architecture.md`. Everything else root-level is build plumbing (csproj, slnx, bin/, obj/,
-FodyWeavers.xml); `assets/` holds `logo.*` and the README banner. All files share the single
+FodyWeavers.xml); `assets/` holds the executable ICO and the PNG used in About and README. Host files share the single
 `deskmonitor` namespace — folders are physical only, so XAML `x:Class`/`xmlns:local` never
 reference a folder.
 

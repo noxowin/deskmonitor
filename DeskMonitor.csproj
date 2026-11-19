@@ -9,8 +9,8 @@
     <StartupObject>deskmonitor.Program</StartupObject>
     <!-- Assembly identity + version info. Version is the SINGLE source of truth: the SDK
          generates AssemblyVersion / AssemblyFileVersion / AssemblyInformationalVersion from
-         it (VersionInfo.Current reads the latter at runtime; release.yml checks the tag
-         against this property). src\Properties\AssemblyInfo.cs keeps only what the SDK does
+         it (VersionInfo.Current reads the latter at runtime). The host release tag follows
+         this property. src\Properties\AssemblyInfo.cs keeps only what the SDK does
          NOT generate (the WPF ThemeInfo attribute, ComVisible). -->
     <Version>0.3.0</Version>
     <!-- The SDK stamps InformationalVersion with the commit hash unless this is off —

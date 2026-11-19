@@ -207,7 +207,7 @@ deliberately** — ILRepack merges assemblies and would break the cross-assembly
 
 All source lives under `src/`, grouped **by layer**; everything else (csproj, slnx, bin/, obj/,
 FodyWeavers.xml) stays at the repo root. `assets/` contains DeskMonitor's executable icon and the
-image used on the 关于 page, plus upstream reference artwork. Host files share the single
+image used on the 关于 page and README. Host files share the single
 `deskmonitor` namespace — folders are
 physical only, so XAML `x:Class`/`xmlns:local` never reference a folder.
 
@@ -234,7 +234,7 @@ src/
     Common/                 formatters · ProcessListTip · ProcessKillMenu (the process lists' right-click 结束进程: list-level menu + confirm card, same rebind-proof pattern as ProcessListTip) · ProcessIconCache (the shared per-exe icon cache) · ChartTipHost/ChartPalette (the shared chart hover tip + colors) · PivotNavButtonFix · FollowTagPanel · the scroll stack
     Details/                the metric IDetailViews
     Charts/                 hand-drawn DrawingContext charts
-    Settings/               SettingsWindow (iNKORE NavigationView 类别 shell: 通用 / 外观 / 采样项目 + pane-footer 关于 — one visibility-switched TouchDragScrollViewer page each; the categories are SettingsCard/SettingsExpander, 关于 is a centred hero page — logo/name/version pill + live CPU waveform + link buttons, no cards)
+    Settings/               SettingsWindow (iNKORE NavigationView shell: 通用 / 外观 / 采样项目 / 插件 + pane-footer 关于) and the plugin management page
 ```
 
 **App.xaml under `src/`** needs the explicit `<Page Remove>` + `<ApplicationDefinition Include>`
